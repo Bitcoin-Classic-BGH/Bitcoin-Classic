@@ -989,7 +989,7 @@ bool MemPoolAccept::Finalize(ATMPArgs& args, Workspace& ws)
     // Remove conflicting transactions from the mempool
     for (CTxMemPool::txiter it : allConflicting)
     {
-        LogPrint(BCLog::MEMPOOL, "replacing tx %s with %s for %s BTC additional fees, %d delta bytes\n",
+        LogPrint(BCLog::MEMPOOL, "replacing tx %s with %s for %s BGH additional fees, %d delta bytes\n",
                 it->GetTx().GetHash().ToString(),
                 hash.ToString(),
                 FormatMoney(nModifiedFees - nConflictingFees),
@@ -1233,7 +1233,13 @@ bool ReadRawBlockFromDisk(std::vector<uint8_t>& block, const CBlockIndex* pindex
 
 CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams)
 {
-    int halvings = nHeight / consensusParams.nSubsidyHalvingInterval;
+    int halvings;
+    if(nHeight < consensusParams.bghforkheight){
+        halvings = nHeight / consensusParams.nSubsidyHalvingInterval;
+    }else{
+        halvings = (nHeight - consensusParams.bghforkheight) / consensusParams.nSubsidyHalvingInterval;
+    }
+
     // Force block reward to zero when right shift is undefined.
     if (halvings >= 64)
         return 0;
@@ -1880,6 +1886,11 @@ static unsigned int GetBlockScriptFlags(const CBlockIndex* pindex, const Consens
     // Start enforcing BIP147 NULLDUMMY (activated simultaneously with segwit)
     if (IsWitnessEnabled(pindex->pprev, consensusparams)) {
         flags |= SCRIPT_VERIFY_NULLDUMMY;
+    }
+
+    // Start enforcing fork id
+    if (pindex->nHeight >= consensusparams.ForkIDHeight) {
+        flags |= SCRIPT_ENABLE_SIGHASH_FORKID;
     }
 
     return flags;
