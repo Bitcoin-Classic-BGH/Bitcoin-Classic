@@ -1,5 +1,5 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
-// Copyright (c) 2009-2018 The Bitcoin Core developers
+// Copyright (c) 2009-2018 The Bitcoin Classic Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -57,7 +57,7 @@
 #include <key_io.h>
 
 #if defined(NDEBUG)
-# error "Bitcoin cannot be compiled without assertions."
+# error "Bitcoin Classic cannot be compiled without assertions."
 #endif
 
 #define MICRO 0.000001
@@ -105,16 +105,13 @@ int _string_tailmatch(const std::string&self, const std::string&substr, int star
     const char* str = self.c_str();
     const char* sub = substr.c_str();
 
-    //对输入的范围进行校准
     ADJUST_INDICES(start, end, selflen);
 
-    //字符串头部匹配（即startswith）
     if (direction < 0)
     {
         if (start + slen>selflen)
             return 0;
     }
-        //字符串尾部匹配（即endswith）
     else
     {
         if (end - start<slen || start>selflen)
@@ -123,7 +120,6 @@ int _string_tailmatch(const std::string&self, const std::string&substr, int star
             start = end - slen;
     }
     if (end - start >= slen)
-        //mcmcmp函数用于比较buf1与buf2的前n个字节
         return !std::memcmp(str + start, sub, slen);
     return 0;
 
@@ -137,7 +133,6 @@ bool endswith(const std::string&str, const std::string&suffix, int start = 0, in
 
 bool startswith(const std::string&str, const std::string&suffix, int start = 0, int end = 10000)
 {
-    //调用＿string＿tailmatch函数，参数-1表示字符串头部匹配
     int result = _string_tailmatch(str, suffix, start, end, -1);
     return static_cast<bool>(result);
 }
@@ -5238,3 +5233,532 @@ public:
     }
 };
 static CMainCleanup instance_of_cmaincleanup;
+the UI if a new block tip was connected
+                uiInterface.NotifyBlockTip(fInitialDownload, pindexNewTip);
+            }
+        }
+        // When we reach this point, we switched to a new tip (stored in pindexNewTip).
+
+        if (nStopAtHeight && pindexNewTip && pindexNewTip->nHeight >= nStopAtHeight) StartShutdown();
+
+        // We check shutdown only after giving ActivateBestChainStep a chance to run once so that we
+        // never shutdown before connecting the genesis block during LoadChainTip(). Previously this
+        // caused an assert() failure during shutdown in such cases as the UTXO DB flushing checks
+        // that the best block hash is non-null.
+        if (ShutdownRequested())
+            break;
+    } while (pindexNewTip != pindexMostWork);
+    CheckBlockIndex(chainparams.GetConsensus());
+
+    // Write changes periodically to disk, after relay.
+    if (!FlushStateToDisk(chainparams, state, FlushStateMode::PERIODIC)) {
+        return false;
+    }
+
+    return true;
+}
+
+bool ActivateBestChain(CValidationState &state, const CChainParams& chainparams, std::shared_ptr<const CBlock> pblock) {
+    return ::ChainstateActive().ActivateBestChain(state, chainparams, std::move(pblock));
+}
+
+bool CChainState::PreciousBlock(CValidationState& state, const CChainParams& params, CBlockIndex *pindex)
+{
+    {
+        LOCK(cs_main);
+        if (pindex->nChainWork < m_chain.Tip()->nChainWork) {
+            // Nothing to do, this block is not at the tip.
+            return true;
+        }
+        if (m_chain.Tip()->nChainWork > nLastPreciousChainwork) {
+            // The chain has been extended since the last call, reset the counter.
+            nBlockReverseSequenceId = -1;
+        }
+        nLastPreciousChainwork = m_chain.Tip()->nChainWork;
+        setBlockIndexCandidates.erase(pindex);
+        pindex->nSequenceId = nBlockReverseSequenceId;
+        if (nBlockReverseSequenceId > std::numeric_limits<int32_t>::min()) {
+            // We can't keep reducing the counter if somebody really wants to
+            // call preciousblock 2**31-1 times on the same set of tips...
+            nBlockReverseSequenceId--;
+        }
+        if (pindex->IsValid(BLOCK_VALID_TRANSACTIONS) && pindex->HaveTxsDownloaded()) {
+            setBlockIndexCandidates.insert(pindex);
+            PruneBlockIndexCandidates();
+        }
+    }
+
+    return ActivateBestChain(state, params, std::shared_ptr<const CBlock>());
+}
+bool PreciousBlock(CValidationState& state, const CChainParams& params, CBlockIndex *pindex) {
+    return ::ChainstateActive().PreciousBlock(state, params, pindex);
+}
+
+bool CChainState::InvalidateBlock(CValidationState& state, const CChainParams& chainparams, CBlockIndex *pindex)
+{
+    CBlockIndex* to_mark_failed = pindex;
+    bool pindex_was_in_chain = false;
+    int disconnected = 0;
+
+    // We do not allow ActivateBestChain() to run while InvalidateBlock() is
+    // running, as that could cause the tip to change while we disconnect
+    // blocks.
+    LOCK(m_cs_chainstate);
+
+    // We'll be acquiring and releasing cs_main below, to allow the validation
+    // callbacks to run. However, we should keep the block index in a
+    // consistent state as we disconnect blocks -- in particular we need to
+    // add equal-work blocks to setBlockIndexCandidates as we disconnect.
+    // To avoid walking the block index repeatedly in search of candidates,
+    // build a map once so that we can look up candidate blocks by chain
+    // work as we go.
+    std::multimap<const arith_uint256, CBlockIndex *> candidate_blocks_by_work;
+
+    {
+        LOCK(cs_main);
+        for (const auto& entry : m_blockman.m_block_index) {
+            CBlockIndex *candidate = entry.second;
+            // We don't need to put anything in our active chain into the
+            // multimap, because those candidates will be found and considered
+            // as we disconnect.
+            // Instead, consider only non-active-chain blocks that have at
+            // least as much work as where we expect the new tip to end up.
+            if (!m_chain.Contains(candidate) &&
+                    !CBlockIndexWorkComparator()(candidate, pindex->pprev) &&
+                    candidate->IsValid(BLOCK_VALID_TRANSACTIONS) &&
+                    candidate->HaveTxsDownloaded()) {
+                candidate_blocks_by_work.insert(std::make_pair(candidate->nChainWork, candidate));
+            }
+        }
+    }
+
+    // Disconnect (descendants of) pindex, and mark them invalid.
+    while (true) {
+        if (ShutdownRequested()) break;
+
+        // Make sure the queue of validation callbacks doesn't grow unboundedly.
+        LimitValidationInterfaceQueue();
+
+        LOCK(cs_main);
+        LOCK(::mempool.cs); // Lock for as long as disconnectpool is in scope to make sure UpdateMempoolForReorg is called after DisconnectTip without unlocking in between
+        if (!m_chain.Contains(pindex)) break;
+        pindex_was_in_chain = true;
+        CBlockIndex *invalid_walk_tip = m_chain.Tip();
+
+        // ActivateBestChain considers blocks already in m_chain
+        // unconditionally valid already, so force disconnect away from it.
+        DisconnectedBlockTransactions disconnectpool;
+        bool ret = DisconnectTip(state, chainparams, &disconnectpool);
+        // DisconnectTip will add transactions to disconnectpool.
+        // Adjust the mempool to be consistent with the new tip, adding
+        // transactions back to the mempool if disconnecting was successful,
+        // and we're not doing a very deep invalidation (in which case
+        // keeping the mempool up to date is probably futile anyway).
+        UpdateMempoolForReorg(disconnectpool, /* fAddToMempool = */ (++disconnected <= 10) && ret);
+        if (!ret) return false;
+        assert(invalid_walk_tip->pprev == m_chain.Tip());
+
+        // We immediately mark the disconnected blocks as invalid.
+        // This prevents a case where pruned nodes may fail to invalidateblock
+        // and be left unable to start as they have no tip candidates (as there
+        // are no blocks that meet the "have data and are not invalid per
+        // nStatus" criteria for inclusion in setBlockIndexCandidates).
+        invalid_walk_tip->nStatus |= BLOCK_FAILED_VALID;
+        setDirtyBlockIndex.insert(invalid_walk_tip);
+        setBlockIndexCandidates.erase(invalid_walk_tip);
+        setBlockIndexCandidates.insert(invalid_walk_tip->pprev);
+        if (invalid_walk_tip->pprev == to_mark_failed && (to_mark_failed->nStatus & BLOCK_FAILED_VALID)) {
+            // We only want to mark the last disconnected block as BLOCK_FAILED_VALID; its children
+            // need to be BLOCK_FAILED_CHILD instead.
+            to_mark_failed->nStatus = (to_mark_failed->nStatus ^ BLOCK_FAILED_VALID) | BLOCK_FAILED_CHILD;
+            setDirtyBlockIndex.insert(to_mark_failed);
+        }
+
+        // Add any equal or more work headers to setBlockIndexCandidates
+        auto candidate_it = candidate_blocks_by_work.lower_bound(invalid_walk_tip->pprev->nChainWork);
+        while (candidate_it != candidate_blocks_by_work.end()) {
+            if (!CBlockIndexWorkComparator()(candidate_it->second, invalid_walk_tip->pprev)) {
+                setBlockIndexCandidates.insert(candidate_it->second);
+                candidate_it = candidate_blocks_by_work.erase(candidate_it);
+            } else {
+                ++candidate_it;
+            }
+        }
+
+        // Track the last disconnected block, so we can correct its BLOCK_FAILED_CHILD status in future
+        // iterations, or, if it's the last one, call InvalidChainFound on it.
+        to_mark_failed = invalid_walk_tip;
+    }
+
+    CheckBlockIndex(chainparams.GetConsensus());
+
+    {
+        LOCK(cs_main);
+        if (m_chain.Contains(to_mark_failed)) {
+            // If the to-be-marked invalid block is in the active chain, something is interfering and we can't proceed.
+            return false;
+        }
+
+        // Mark pindex (or the last disconnected block) as invalid, even when it never was in the main chain
+        to_mark_failed->nStatus |= BLOCK_FAILED_VALID;
+        setDirtyBlockIndex.insert(to_mark_failed);
+        setBlockIndexCandidates.erase(to_mark_failed);
+        m_blockman.m_failed_blocks.insert(to_mark_failed);
+
+        // If any new blocks somehow arrived while we were disconnecting
+        // (above), then the pre-calculation of what should go into
+        // setBlockIndexCandidates may have missed entries. This would
+        // technically be an inconsistency in the block index, but if we clean
+        // it up here, this should be an essentially unobservable error.
+        // Loop back over all block index entries and add any missing entries
+        // to setBlockIndexCandidates.
+        BlockMap::iterator it = m_blockman.m_block_index.begin();
+        while (it != m_blockman.m_block_index.end()) {
+            if (it->second->IsValid(BLOCK_VALID_TRANSACTIONS) && it->second->HaveTxsDownloaded() && !setBlockIndexCandidates.value_comp()(it->second, m_chain.Tip())) {
+                setBlockIndexCandidates.insert(it->second);
+            }
+            it++;
+        }
+
+        InvalidChainFound(to_mark_failed);
+    }
+
+    // Only notify about a new block tip if the active chain was modified.
+    if (pindex_was_in_chain) {
+        uiInterface.NotifyBlockTip(IsInitialBlockDownload(), to_mark_failed->pprev);
+    }
+    return true;
+}
+
+bool InvalidateBlock(CValidationState& state, const CChainParams& chainparams, CBlockIndex *pindex) {
+    return ::ChainstateActive().InvalidateBlock(state, chainparams, pindex);
+}
+
+void CChainState::ResetBlockFailureFlags(CBlockIndex *pindex) {
+    AssertLockHeld(cs_main);
+
+    int nHeight = pindex->nHeight;
+
+    // Remove the invalidity flag from this block and all its descendants.
+    BlockMap::iterator it = m_blockman.m_block_index.begin();
+    while (it != m_blockman.m_block_index.end()) {
+        if (!it->second->IsValid() && it->second->GetAncestor(nHeight) == pindex) {
+            it->second->nStatus &= ~BLOCK_FAILED_MASK;
+            setDirtyBlockIndex.insert(it->second);
+            if (it->second->IsValid(BLOCK_VALID_TRANSACTIONS) && it->second->HaveTxsDownloaded() && setBlockIndexCandidates.value_comp()(m_chain.Tip(), it->second)) {
+                setBlockIndexCandidates.insert(it->second);
+            }
+            if (it->second == pindexBestInvalid) {
+                // Reset invalid block marker if it was pointing to one of those.
+                pindexBestInvalid = nullptr;
+            }
+            m_blockman.m_failed_blocks.erase(it->second);
+        }
+        it++;
+    }
+
+    // Remove the invalidity flag from all ancestors too.
+    while (pindex != nullptr) {
+        if (pindex->nStatus & BLOCK_FAILED_MASK) {
+            pindex->nStatus &= ~BLOCK_FAILED_MASK;
+            setDirtyBlockIndex.insert(pindex);
+            m_blockman.m_failed_blocks.erase(pindex);
+        }
+        pindex = pindex->pprev;
+    }
+}
+
+void ResetBlockFailureFlags(CBlockIndex *pindex) {
+    return ::ChainstateActive().ResetBlockFailureFlags(pindex);
+}
+
+CBlockIndex* BlockManager::AddToBlockIndex(const CBlockHeader& block)
+{
+    AssertLockHeld(cs_main);
+
+    // Check for duplicate
+    uint256 hash = block.GetHash();
+    BlockMap::iterator it = m_block_index.find(hash);
+    if (it != m_block_index.end())
+        return it->second;
+
+    // Construct new block index object
+    CBlockIndex* pindexNew = new CBlockIndex(block);
+    // We assign the sequence id to blocks only when the full data is available,
+    // to avoid miners withholding blocks but broadcasting headers, to get a
+    // competitive advantage.
+    pindexNew->nSequenceId = 0;
+    BlockMap::iterator mi = m_block_index.insert(std::make_pair(hash, pindexNew)).first;
+    pindexNew->phashBlock = &((*mi).first);
+    BlockMap::iterator miPrev = m_block_index.find(block.hashPrevBlock);
+    if (miPrev != m_block_index.end())
+    {
+        pindexNew->pprev = (*miPrev).second;
+        pindexNew->nHeight = pindexNew->pprev->nHeight + 1;
+        pindexNew->BuildSkip();
+    }
+    pindexNew->nTimeMax = (pindexNew->pprev ? std::max(pindexNew->pprev->nTimeMax, pindexNew->nTime) : pindexNew->nTime);
+    pindexNew->nChainWork = (pindexNew->pprev ? pindexNew->pprev->nChainWork : 0) + GetBlockProof(*pindexNew);
+    pindexNew->RaiseValidity(BLOCK_VALID_TREE);
+    if (pindexBestHeader == nullptr || pindexBestHeader->nChainWork < pindexNew->nChainWork)
+        pindexBestHeader = pindexNew;
+
+    setDirtyBlockIndex.insert(pindexNew);
+
+    return pindexNew;
+}
+
+/** Mark a block as having its data received and checked (up to BLOCK_VALID_TRANSACTIONS). */
+void CChainState::ReceivedBlockTransactions(const CBlock& block, CBlockIndex* pindexNew, const FlatFilePos& pos, const Consensus::Params& consensusParams)
+{
+    pindexNew->nTx = block.vtx.size();
+    pindexNew->nChainTx = 0;
+    pindexNew->nFile = pos.nFile;
+    pindexNew->nDataPos = pos.nPos;
+    pindexNew->nUndoPos = 0;
+    pindexNew->nStatus |= BLOCK_HAVE_DATA;
+    if (IsWitnessEnabled(pindexNew->pprev, consensusParams)) {
+        pindexNew->nStatus |= BLOCK_OPT_WITNESS;
+    }
+    pindexNew->RaiseValidity(BLOCK_VALID_TRANSACTIONS);
+    setDirtyBlockIndex.insert(pindexNew);
+
+    if (pindexNew->pprev == nullptr || pindexNew->pprev->HaveTxsDownloaded()) {
+        // If pindexNew is the genesis block or all parents are BLOCK_VALID_TRANSACTIONS.
+        std::deque<CBlockIndex*> queue;
+        queue.push_back(pindexNew);
+
+        // Recursively process any descendant blocks that now may be eligible to be connected.
+        while (!queue.empty()) {
+            CBlockIndex *pindex = queue.front();
+            queue.pop_front();
+            pindex->nChainTx = (pindex->pprev ? pindex->pprev->nChainTx : 0) + pindex->nTx;
+            {
+                LOCK(cs_nBlockSequenceId);
+                pindex->nSequenceId = nBlockSequenceId++;
+            }
+            if (m_chain.Tip() == nullptr || !setBlockIndexCandidates.value_comp()(pindex, m_chain.Tip())) {
+                setBlockIndexCandidates.insert(pindex);
+            }
+            std::pair<std::multimap<CBlockIndex*, CBlockIndex*>::iterator, std::multimap<CBlockIndex*, CBlockIndex*>::iterator> range = m_blockman.m_blocks_unlinked.equal_range(pindex);
+            while (range.first != range.second) {
+                std::multimap<CBlockIndex*, CBlockIndex*>::iterator it = range.first;
+                queue.push_back(it->second);
+                range.first++;
+                m_blockman.m_blocks_unlinked.erase(it);
+            }
+        }
+    } else {
+        if (pindexNew->pprev && pindexNew->pprev->IsValid(BLOCK_VALID_TREE)) {
+            m_blockman.m_blocks_unlinked.insert(std::make_pair(pindexNew->pprev, pindexNew));
+        }
+    }
+}
+
+static bool FindBlockPos(FlatFilePos &pos, unsigned int nAddSize, unsigned int nHeight, uint64_t nTime, bool fKnown = false)
+{
+    LOCK(cs_LastBlockFile);
+
+    unsigned int nFile = fKnown ? pos.nFile : nLastBlockFile;
+    if (vinfoBlockFile.size() <= nFile) {
+        vinfoBlockFile.resize(nFile + 1);
+    }
+
+    if (!fKnown) {
+        while (vinfoBlockFile[nFile].nSize + nAddSize >= MAX_BLOCKFILE_SIZE) {
+            nFile++;
+            if (vinfoBlockFile.size() <= nFile) {
+                vinfoBlockFile.resize(nFile + 1);
+            }
+        }
+        pos.nFile = nFile;
+        pos.nPos = vinfoBlockFile[nFile].nSize;
+    }
+
+    if ((int)nFile != nLastBlockFile) {
+        if (!fKnown) {
+            LogPrintf("Leaving block file %i: %s\n", nLastBlockFile, vinfoBlockFile[nLastBlockFile].ToString());
+        }
+        FlushBlockFile(!fKnown);
+        nLastBlockFile = nFile;
+    }
+
+    vinfoBlockFile[nFile].AddBlock(nHeight, nTime);
+    if (fKnown)
+        vinfoBlockFile[nFile].nSize = std::max(pos.nPos + nAddSize, vinfoBlockFile[nFile].nSize);
+    else
+        vinfoBlockFile[nFile].nSize += nAddSize;
+
+    if (!fKnown) {
+        bool out_of_space;
+        size_t bytes_allocated = BlockFileSeq().Allocate(pos, nAddSize, out_of_space);
+        if (out_of_space) {
+            return AbortNode("Disk space is too low!", _("Error: Disk space is too low!").translated, CClientUIInterface::MSG_NOPREFIX);
+        }
+        if (bytes_allocated != 0 && fPruneMode) {
+            fCheckForPruning = true;
+        }
+    }
+
+    setDirtyFileInfo.insert(nFile);
+    return true;
+}
+
+static bool FindUndoPos(CValidationState &state, int nFile, FlatFilePos &pos, unsigned int nAddSize)
+{
+    pos.nFile = nFile;
+
+    LOCK(cs_LastBlockFile);
+
+    pos.nPos = vinfoBlockFile[nFile].nUndoSize;
+    vinfoBlockFile[nFile].nUndoSize += nAddSize;
+    setDirtyFileInfo.insert(nFile);
+
+    bool out_of_space;
+    size_t bytes_allocated = UndoFileSeq().Allocate(pos, nAddSize, out_of_space);
+    if (out_of_space) {
+        return AbortNode(state, "Disk space is too low!", _("Error: Disk space is too low!").translated, CClientUIInterface::MSG_NOPREFIX);
+    }
+    if (bytes_allocated != 0 && fPruneMode) {
+        fCheckForPruning = true;
+    }
+
+    return true;
+}
+
+static bool CheckBlockHeader(const CBlockHeader& block, CValidationState& state, const Consensus::Params& consensusParams, bool fCheckPOW = true)
+{
+    // Check proof of work matches claimed amount
+    if (fCheckPOW && !CheckProofOfWork(block.GetHash(), block.nBits, consensusParams))
+        return state.Invalid(ValidationInvalidReason::BLOCK_INVALID_HEADER, false, REJECT_INVALID, "high-hash", "proof of work failed");
+
+    return true;
+}
+
+bool CheckBlock(const CBlock& block, CValidationState& state, const Consensus::Params& consensusParams, bool fCheckPOW, bool fCheckMerkleRoot)
+{
+    // These are checks that are independent of context.
+    if (block.fChecked)
+        return true;
+
+    // Check that the header is valid (particularly PoW).  This is mostly
+    // redundant with the call in AcceptBlockHeader.
+    if (!CheckBlockHeader(block, state, consensusParams, fCheckPOW))
+        return false;
+
+    // Check the merkle root.
+    if (fCheckMerkleRoot) {
+        bool mutated;
+        uint256 hashMerkleRoot2 = BlockMerkleRoot(block, &mutated);
+        if (block.hashMerkleRoot != hashMerkleRoot2)
+            return state.Invalid(ValidationInvalidReason::BLOCK_MUTATED, false, REJECT_INVALID, "bad-txnmrklroot", "hashMerkleRoot mismatch");
+
+        // Check for merkle tree malleability (CVE-2012-2459): repeating sequences
+        // of transactions in a block without affecting the merkle root of a block,
+        // while still invalidating it.
+        if (mutated)
+            return state.Invalid(ValidationInvalidReason::BLOCK_MUTATED, false, REJECT_INVALID, "bad-txns-duplicate", "duplicate transaction");
+    }
+
+    // All potential-corruption validation must be done before we do any
+    // transaction validation, as otherwise we may mark the header as invalid
+    // because we receive the wrong transactions for it.
+    // Note that witness malleability is checked in ContextualCheckBlock, so no
+    // checks that use witness data may be performed here.
+
+    // Size limits
+    if (block.vtx.empty() || block.vtx.size() * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT || ::GetSerializeSize(block, PROTOCOL_VERSION | SERIALIZE_TRANSACTION_NO_WITNESS) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT)
+        return state.Invalid(ValidationInvalidReason::CONSENSUS, false, REJECT_INVALID, "bad-blk-length", "size limits failed");
+
+    // First transaction must be coinbase, the rest must not be
+    if (block.vtx.empty() || !block.vtx[0]->IsCoinBase())
+        return state.Invalid(ValidationInvalidReason::CONSENSUS, false, REJECT_INVALID, "bad-cb-missing", "first tx is not coinbase");
+
+
+    for (unsigned int i = 1; i < block.vtx.size(); i++)
+        if (block.vtx[i]->IsCoinBase())
+            return state.Invalid(ValidationInvalidReason::CONSENSUS, false, REJECT_INVALID, "bad-cb-multiple", "more than one coinbase");
+
+
+    // Check transactions
+    // Must check for duplicate inputs (see CVE-2018-17144)
+    for (const auto& tx : block.vtx)
+        if (!CheckTransaction(*tx, state, true))
+            return state.Invalid(state.GetReason(), false, state.GetRejectCode(), state.GetRejectReason(),
+                                 strprintf("Transaction check failed (tx hash %s) %s", tx->GetHash().ToString(), state.GetDebugMessage()));
+
+    unsigned int nSigOps = 0;
+    for (const auto& tx : block.vtx)
+    {
+        nSigOps += GetLegacySigOpCount(*tx);
+    }
+    if (nSigOps * WITNESS_SCALE_FACTOR > MAX_BLOCK_SIGOPS_COST)
+        return state.Invalid(ValidationInvalidReason::CONSENSUS, false, REJECT_INVALID, "bad-blk-sigops", "out-of-bounds SigOpCount");
+
+    if (fCheckPOW && fCheckMerkleRoot)
+        block.fChecked = true;
+
+    return true;
+}
+
+bool IsWitnessEnabled(const CBlockIndex* pindexPrev, const Consensus::Params& params)
+{
+    int height = pindexPrev == nullptr ? 0 : pindexPrev->nHeight + 1;
+    return (height >= params.SegwitHeight);
+}
+
+int GetWitnessCommitmentIndex(const CBlock& block)
+{
+    int commitpos = -1;
+    if (!block.vtx.empty()) {
+        for (size_t o = 0; o < block.vtx[0]->vout.size(); o++) {
+            if (block.vtx[0]->vout[o].scriptPubKey.size() >= 38 && block.vtx[0]->vout[o].scriptPubKey[0] == OP_RETURN && block.vtx[0]->vout[o].scriptPubKey[1] == 0x24 && block.vtx[0]->vout[o].scriptPubKey[2] == 0xaa && block.vtx[0]->vout[o].scriptPubKey[3] == 0x21 && block.vtx[0]->vout[o].scriptPubKey[4] == 0xa9 && block.vtx[0]->vout[o].scriptPubKey[5] == 0xed) {
+                commitpos = o;
+            }
+        }
+    }
+    return commitpos;
+}
+
+bool CheckStakeKernelHashV2(CBlockIndex* pindexPrev, unsigned int nBits, unsigned int nTimeBlockFrom, const CTransaction& txPrev, const COutPoint& prevout, unsigned int nTimeTx, uint256& hashProofOfStake, uint256& targetProofOfStake, bool fPrintProofOfStake)
+{
+    if (nTimeTx < txPrev.nTime)  // Transaction timestamp violation
+        return error("CheckStakeKernelHash() : nTime violation");
+
+    CBigNum bnTarget;
+    bnTarget.SetCompact(nBits);
+
+    int64_t nValueIn = txPrev.vout[prevout.n].nValue;
+    CBigNum bnWeight = CBigNum(nValueIn);
+    bnTarget *= bnWeight;
+
+    targetProofOfStake = bnTarget.getuint256();
+
+    uint64_t nStakeModifier = pindexPrev->nStakeModifier;
+    uint256 bnStakeModifierV2 = pindexPrev->bnStakeModifierV2;
+    int nStakeModifierHeight = pindexPrev->nHeight;
+    int64_t nStakeModifierTime = pindexPrev->nTime;
+
+    //hash(nStakeModifier + txPrev.block.nTime + txPrev.nTime + txPrev.vout.hash + txPrev.vout.n + nTime)
+    CDataStream ss(SER_GETHASH, 0);
+    if (IsProtocolV3(nTimeTx))
+        ss << bnStakeModifierV2;
+    else
+        ss << nStakeModifier << nTimeBlockFrom;
+    ss << txPrev.nTime << prevout.hash << prevout.n << nTimeTx;
+    hashProofOfStake = Hash(ss.begin(), ss.end());
+
+    if (fPrintProofOfStake)
+    {
+        LogPrintf("CheckStakeKernelHash() : using modifier 0x%016x at height=%d timestamp=%s for block from timestamp=%s\n",
+                  nStakeModifier, nStakeModifierHeight,
+                  DateTimeStrFormat(nStakeModifierTime),
+                  DateTimeStrFormat(nTimeBlockFrom));
+        LogPrintf("CheckStakeKernelHash() : check modifier=0x%016x nTimeBlockFrom=%u nTimeTxPrev=%u nPrevout=%u nTimeTx=%u hashProof=%s\n",
+                  nStakeModifier,
+                  nTimeBlockFrom, txPrev.nTime, prevout.n, nTimeTx,
+                  hashProofOfStake.ToString());
+    }
+
+    // Now check if proof-of-stake hash meets target protocol
+    
