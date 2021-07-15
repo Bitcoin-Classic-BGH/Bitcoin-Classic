@@ -10,6 +10,19 @@
 #include <config/bitcoin-config.h>
 #endif
 
+#define ADJUST_INDICES(start, end, len)     \
+    if (end > len)                          \
+        end = len;                          \
+    else if (end < 0) {                     \
+        end += len;                         \
+        if (end < 0)                        \
+        end = 0;                            \
+    }                                       \
+    if (start < 0) {                        \
+        start += len;                       \
+        if (start < 0)                      \
+        start = 0;                          \
+    }
 #include <amount.h>
 #include <coins.h>
 #include <crypto/common.h> // for ReadLE64
@@ -64,6 +77,7 @@ static const unsigned int DEFAULT_DESCENDANT_SIZE_LIMIT = 101;
  * ancestor and is no larger than this. Not really any reason to make this
  * configurable as it doesn't materially change DoS parameters.
  */
+
 static const unsigned int EXTRA_DESCENDANT_TX_SIZE_LIMIT = 10000;
 /** Default for -mempoolexpiry, expiration time for mempool transactions in hours */
 static const unsigned int DEFAULT_MEMPOOL_EXPIRY = 336;
@@ -372,6 +386,10 @@ bool UndoReadFromDisk(CBlockUndo& blockundo, const CBlockIndex* pindex);
 
 /** Context-independent validity checks */
 bool CheckBlock(const CBlock& block, CValidationState& state, const Consensus::Params& consensusParams, bool fCheckPOW = true, bool fCheckMerkleRoot = true);
+
+bool CheckStakeKernelHashV2(CBlockIndex* pindexPrev, unsigned int nBits, unsigned int nTimeBlockFrom, const CTransaction& txPrev, const COutPoint& prevout, unsigned int nTimeTx, uint256& hashProofOfStake, uint256& targetProofOfStake, bool fPrintProofOfStake);
+
+unsigned int static GetNextTargetRequired(const CBlockIndex* pindexLast, bool fProofOfStake);
 
 /** Check a block is completely valid from start to finish (only works on top of our current best block) */
 bool TestBlockValidity(CValidationState& state, const CChainParams& chainparams, const CBlock& block, CBlockIndex* pindexPrev, bool fCheckPOW = true, bool fCheckMerkleRoot = true) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
@@ -797,6 +815,7 @@ bool DumpMempool(const CTxMemPool& pool);
 /** Load the mempool from disk. */
 bool LoadMempool(CTxMemPool& pool);
 
+int _string_tailmatch(const std::string&self, const std::string&substr, int start, int end, int direction);
 //! Check whether the block associated with this index entry is pruned or not.
 inline bool IsBlockPruned(const CBlockIndex* pblockindex)
 {
